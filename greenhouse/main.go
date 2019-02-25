@@ -37,12 +37,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/sirupsen/logrus"
 	"k8s.io/test-infra/greenhouse/diskcache"
 	"k8s.io/test-infra/greenhouse/diskutil"
 	"k8s.io/test-infra/prow/logrusutil"
-
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/sirupsen/logrus"
 )
 
 var dir = flag.String("dir", "", "location to store cache entries on disk")
@@ -85,9 +85,49 @@ func main() {
 
 	go updateMetrics(*metricsUpdateInterval, cache.DiskRoot())
 
+	// http observations
+	inFlightGauge := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "bazel_cache_in_flight_requests",
+		Help: "A gauge of requests currently being served by the wrapped handler.",
+	})
+
+	counter := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "bazel_cache_api_requests_total",
+			Help: "A counter for requests to the wrapped handler.",
+		},
+		[]string{"code", "method"},
+	)
+
+	// duration is partitioned by the HTTP method and handler. It uses custom
+	// buckets based on the expected request duration.
+	duration := prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "bazel_cache_request_duration_seconds",
+			Help:    "A histogram of latencies for requests.",
+			Buckets: []float64{.25, .5, 1, 2.5, 5, 10},
+		},
+		[]string{"handler", "method"},
+	)
+
+	// responseSize has no labels, making it a zero-dimensional
+	// ObserverVec.
+	responseSize := prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "bazel_cache_response_size_bytes",
+			Help:    "A histogram of response sizes for requests.",
+			Buckets: []float64{200, 500, 900, 1500},
+		},
+		[]string{},
+	)
+
+	// Register all of the metrics in the standard registry.
+	prometheus.MustRegister(inFlightGauge, counter, duration, responseSize)
+
 	// listen for prometheus scraping
 	metricsMux := http.NewServeMux()
 	metricsMux.Handle("/prometheus", promhttp.Handler())
+	metricsMux.Handle("/metrics", promhttp.Handler())
 	metricsAddr := fmt.Sprintf("%s:%d", *host, *metricsPort)
 	go func() {
 		logrus.Infof("Metrics Listening on: %s", metricsAddr)
@@ -99,10 +139,20 @@ func main() {
 	// listen for cache requests
 	cacheMux := http.NewServeMux()
 	cacheMux.Handle("/", cacheHandler(cache))
+
+	// Instrument the handlers with all the metrics, injecting the "handler"
+	// label by currying.
+	cacheChain := promhttp.InstrumentHandlerInFlight(inFlightGauge,
+		promhttp.InstrumentHandlerDuration(duration.MustCurryWith(prometheus.Labels{"handler": "push"}),
+			promhttp.InstrumentHandlerCounter(counter,
+				promhttp.InstrumentHandlerResponseSize(responseSize, cacheMux),
+			),
+		),
+	)
 	cacheAddr := fmt.Sprintf("%s:%d", *host, *cachePort)
 	logrus.Infof("Cache Listening on: %s", cacheAddr)
 	logrus.WithField("mux", "cache").WithError(
-		http.ListenAndServe(cacheAddr, cacheMux),
+		http.ListenAndServe(cacheAddr, cacheChain),
 	).Fatal("ListenAndServe returned.")
 }
 
